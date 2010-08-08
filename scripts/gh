@@ -1,27 +1,48 @@
 #!/usr/bin/env perl
-use LWP::Simple;
-use JSON;
-use utf8;
+use strict;
 use warnings;
-use constant debug => $ENV{DEBUG};
-use App::gh;
+use JSON;
+use LWP::Simple qw/get/;
+use Config::INI::Reader;
+use Getopt::Long qw/GetOptions/;
+use URI::Escape qw/uri_escape/;
+use Data::Dumper;
+use ExtUtils::MakeMaker qw/prompt/;
+
+our $VERSION = '0.09';
+
+use constant DEBUG        => $ENV{PERL_GH_DEBUG}        || 0;
+use constant WRAP         => $ENV{PERL_GH_WRAP}         || 0;
+use constant SCREEN_WIDTH => $ENV{PERL_GH_SCREEN_WIDTH} || 92;
+
+$LWP::Simple::ua->agent("gh/VERSION $VERSION");
 
 $|++;
-binmode STDOUT, ':utf8';
+binmode STDOUT => ':utf8';
+binmode STDERR => ':utf8';
 
-my $screen_width = 92;
+GetOptions(
+    'h|help!'   => \my $help,
+    'V|version' => \my $version,
+) or help();
+help()    if $help;
+version() if $version;
+
+local $SIG{INT} = sub { exit };
+
+action(@ARGV);
+exit;
 
 sub _debug {
-    print STDERR @_,"\n" if debug;
+    print STDERR @_, "\n" if DEBUG;
 }
 
 sub _info {
-    print STDERR @_,"\n";
+    print STDERR @_, "\n";
 }
 
 sub print_list {
     my @lines = @_;
-
     my $column_w = 0;
 
     map { 
@@ -33,7 +54,7 @@ sub print_list {
 
         my $padding = int($column_w) - length( $title );
 
-        if ( $ENV{WRAP} && ( $column_w + 3 + length( join " ",@$arg) ) > $screen_width ) {
+        if ( WRAP && ( $column_w + 3 + length( join " ",@$arg) ) > SCREEN_WIDTH ) {
             # wrap description
             my $string = $title . " " x $padding . " - " . join(" ",@$arg) . "\n";
             $string =~ s/\n//g;
@@ -42,19 +63,17 @@ sub print_list {
             my $firstline = 1;
             my $tab = 4;
             my $wrapped = 0;
-            while( $string =~ /(.)/g ) {
-                $cnt++;
-
+            while( $string =~ /(.)/g && ++$cnt ) {
                 my $c = $1;
                 print $c;
 
-                if( $c =~ /[ \,]/ && $firstline && $cnt > $screen_width ) {
+                if( $c =~ /[ \,]/ && $firstline && $cnt > SCREEN_WIDTH ) {
                     print "\n" . " " x ($column_w + 3 + $tab );
                     $firstline = 0;
                     $cnt = 0;
                     $wrapped = 1;
                 }
-                elsif( $c =~ /[ \,]/ && ! $firstline && $cnt > ($screen_width - $column_w) ) {
+                elsif( $c =~ /[ \,]/ && ! $firstline && $cnt > (SCREEN_WIDTH - $column_w) ) {
                     print "\n" . " " x ($column_w + 3 + $tab );
                     $cnt = 0;
                     $wrapped = 1;
@@ -73,23 +92,289 @@ sub print_list {
     }
 }
 
+sub action {
+    my $act = shift;
 
+    help() if !$act || $act eq 'help';
 
-# my $config = parse_config $ENV{HOME} . "/.gitconfig";
-# use Data::Dumper; warn Dumper( $config );
+    my $method = main->can($act) || _info("Unkown action: $act") && usage();
+    $method->(@_);
+}
 
-my $act = shift;
-$SIG{INT} = sub {
+sub search {
+    my $keyword = shift || usage(qw/search keyword/);
+    my $json = get 'http://github.com/api/v2/json/repos/search/' . uri_escape $keyword;
+    my $result = decode_json $json;
+
+    my @list;
+    for my $repo (@{$result->{repositories}}) {
+        my $name = sprintf '%s/%s', $repo->{username}, $repo->{name};
+        my $desc = $repo->{description};
+        push @list, [ $name, $desc ];
+    }
+
+    print_list @list;
+}
+sub s { search @_ }
+
+sub clone {
+    my ($user, $repo) = _parse_user(shift);
+    $repo ||= shift;
+    usage(qw/clone user [repo] [attr]/) unless $user && $repo;
+
+    my $attr = shift || 'ro';
+    my $uri  = _uri($attr, $user, $repo);
+    _info "Fetching $uri ...";
+    system qw/git clone/, $uri;
+}
+sub c {  clone @_ }
+
+sub pull {
+    my $acc    = shift || usage(qw/pull account [branch]/);
+    my $branch = shift || 'master';
+
+    die 'git config not found.' unless -e '.git/config';
+    my $config = parse_config('.git/config');
+
+    for my $remote (values %{$config->{remote}}) {
+        my ($my, $repo) = _parse_remote_uri($remote->{url}); 
+        if ($my && $repo) {
+            my $uri = sprintf 'git://github.com/%s/%s.git', $acc, $repo;
+            qx(git pull $uri $branch);
+            last;
+        }
+    }
+}
+sub pullfork { pull @_ }
+sub pf       { pull @_ }
+
+sub list {
+    my $acc = shift || usage(qw/list account/);
+    my $josn = get 'http://github.com/api/v2/json/repos/show/' . uri_escape $acc;
+    my $data = decode_json $josn;
+
+    my @lines;
+    for my $repo (@{$data->{repositories}}) {
+        push @lines, [
+            $acc . '/' . $repo->{name},
+            ($repo->{description} || ''),
+        ];
+    }
+    
+    print_list @lines;
+}
+
+sub cloneall {
+    my $acc  = shift || usage(qw/cloneall account [attr]/); 
+    my $attr = shift || 'ro';
+
+    _info "Getting repository list from github: $acc";
+    my $json = get 'http://github.com/api/v2/json/repos/show/' . uri_escape $acc;
+    my $data = decode_json $json ;
+
+    _info "Will clone repositories below:";
+    for my $repo ( @{ $data->{repositories} } ) {
+        print "  " . $repo->{name} . "\n";
+    }
+
+    for my $repo ( @{ $data->{repositories} } ) {
+        my $repo_name = $repo->{name};
+        (my $local_repo_name = $repo_name) =~ s/\.git$//;
+
+        my $uri = _uri($attr, $acc, $repo_name);
+        _info "Fetching $uri";
+
+        if( -e $local_repo_name ) {
+            print "==> Updating " . $local_repo_name . " ...\n";
+            qx{ cd $local_repo_name ; git pull origin master };
+        }
+        else {
+            print "==> Cloning " . $repo->{name} . " ...\n";
+            qx{ git clone -q $uri };
+        }
+    }
+}
+sub ca { cloneall @_ }
+
+sub network {
+    die 'Git config not found,' unless -e '.git/config';
+    my $branch = shift || 'master';
+
+    my $config = parse_config('.git/config');
+    for my $remote (values %{$config->{remote}}) {
+        my ($acc, $repo) = _parse_remote_uri($remote->{url}); 
+        if ($acc && $repo) {
+            ($acc, $repo) = (uri_escape($acc), uri_escape($repo));
+            my $json = get "http://github.com/api/v2/json/repos/show/$acc/$repo/network";
+            my $data = decode_json $json;
+            my $networks = $data->{network};
+
+            for my $net (@$networks) {
+                _info sprintf '%17s - watchers(%d) forks(%d)',
+                    , $net->{owner}.'/'.$net->{name}
+                    , $net->{watchers}
+                    , $net->{forks}
+            }
+            last;
+        }
+    }
+}
+
+sub fork {
+    my @option = qw/fork [user] [repo]/;
+    my ($user, $repo) = _parse_user(shift);
+    $repo ||= shift;
+
+    my $auth = parse_config("$ENV{HOME}/.gitconfig")->{github};
+
+    unless ($auth->{user} && $auth->{token}) {
+        die << 'MESSAGE';
+Github authtoken not found. Can not fork repository.
+Try
+    $ git config --global github.user username
+    $ git config --global github.token token
+
+SEE ALSO `http://help.github.com/git-email-settings/`
+MESSAGE
+    }
+
+    unless ($repo) {
+        usage(@option) unless -e '.git/config';
+        my $config = parse_config('.git/config');
+        for my $remote (values %{$config->{remote}}) {
+            ($user, $repo) = _parse_remote_uri($remote->{url});
+
+            _info "Found GitHub repository of $user/$repo";
+
+            my $remote_url = sprintf 'git@github.com:%s/%s.git', $auth->{user}, $repo;
+            _info "Adding remote '$auth->{user}' => $remote_url";
+
+            qx(git remote add $auth->{user} $remote_url);
+            _info "Remote added.";
+        }
+    }
+
+    _info 'repository not found' and usage(@option) unless $user && $repo;
+
+    my $schema = 'https';
+    eval { require Net::HTTPS };
+    if ($@) {
+        _info 'WARNING: THIS LWP IS NOT SUPPORTED HTTPS !!';
+        unless (lc(prompt("Are you sure to using `http` schema?", 'n')) eq 'y') {
+            die "SEE ALSO: <http://search.cpan.org/dist/libwww-perl/README.SSL>\n";
+        }
+        $schema = 'http';
+    }
+    my $uri = sprintf '%s://github.com/api/v2/json/repos/fork/%s/%s', $schema, $user, $repo;
+
+    _info "Forking...";
+
+    my $res = $LWP::Simple::ua->post($uri, +{ login => $auth->{user}, token => $auth->{token} });
+    die $res->status_line unless $res->is_success;
+
+    my $json = $res->content;
+    my $data = decode_json $json;
+
+    warn Dumper $data if DEBUG;
+
+    _info 'Repository fored:';
+
+    $data = $data->{repository};
+    print "  Name:          " . $data->{name} . "\n";
+    print "  Description:   " . $data->{description} . "\n";
+    print "  Owner:         " . $data->{owner} . "\n";
+    print "  Watchers:      " . $data->{watchers} . "\n";
+    print "  Created at:    " . $data->{created_at} . "\n";
+    print "  Pushed at:     " . $data->{pushed_at} . "\n";
+    print "  Fork:          " . $data->{'fork'} . "\n";
+    print "  URL:           " . $data->{url} . "\n";
+    print "  Homepage:      " . ($data->{homepage}||'') . "\n";
+}
+
+sub _parse_user {
+    my $user = shift;
+    my $repo;
+
+    if ($user && $user =~ m{/}) {
+        ($user, $repo) = split '/', $user;
+    }
+
+    return $user, $repo;
+}
+
+sub _parse_remote_uri {
+    my $uri = shift;
+    my ($acc, $repo);
+    
+    if ($uri =~ m{/([^/]+)/([^/]+)\.git}) {
+        ($acc, $repo) = ($1, $2);
+    }
+
+    return $acc, $repo;
+}
+
+sub _uri {
+    my ($attr, $user, $repo) = @_;
+
+    my $format;
+    if ($attr eq 'ro') {
+        $format = 'git://github.com/%s/%s.git';
+    }
+    elsif ($attr eq 'ssh') {
+        $format = 'git@github.com:%s/%s.git';
+    }
+    elsif ($attr eq 'http') {
+        $format = 'http://github.com/%s/%s.git';
+    }
+    elsif ($attr eq 'https') {
+        $format = 'https://%s@github.com/%1$s/%s.git';
+    }
+    else {
+        die "Unkown attr: $attr";
+    }
+
+    return sprintf $format, $user, $repo;
+}
+
+sub parse_config {
+    my $config = Config::INI::Reader->read_file(@_);
+    for my $key (keys %$config) {
+        my ($new_key, $nested_key) = $key =~ /^(\w+) ['"](\w+)['"]/;
+        next unless $new_key && $nested_key;
+        $config->{$new_key} ||= {};
+        $config->{$new_key}{$nested_key} = delete $config->{$key};
+    }
+    warn Dumper $config if DEBUG;
+    return $config;
+}
+
+sub usage {
+    my @args = @_;
+    @args = qw/[option] action [args]/ unless @args;
+    my $option = join ' ', @args;
+
+    print << "USAGE";
+Usage: gh $option
+
+Try `gh --help` for more option.
+USAGE
     exit;
-};
+}
 
-if( ! $act || $act eq 'help' ) 
-{
-    print <<'END';
+sub version {
+    print "gh (App::gh) version $VERSION\n";
+    exit;
+}
 
-App::gh
+sub help {
+    print <<'HELP';
+Usage: gh [option] action [args]
 
-show help message;
+Options:
+    -h, --help    show this help message
+    -V,--version  displays software version
+
+show help message:
 
     $ gh help
 
@@ -101,7 +386,7 @@ show help message;
 
     if you want text wrapped:
 
-        $ WRAP=1 gh list c9s
+        $ PERL_GH_WRAP=1 gh list c9s
 
 * clone:
 
@@ -171,247 +456,8 @@ show help message;
         $ cd project
         $ gh pull gugod feature    
 
-END
+HELP
     exit;
-
-}
-elsif( $act eq 'search' || $act eq 's' ) {
-    my $keyword = shift;
-    my $json = get 'http://github.com/api/v2/json/repos/search/' . $keyword;
-
-    my $result = decode_json( $json );
-
-    my @ary = ();
-    for my $repo ( @{ $result->{repositories} } ) {
-        my $name = sprintf "%s/%s", $repo->{username} , $repo->{name};
-        my $desc = $repo->{description};
-        push @ary, [ $name , $desc ];
-    }
-
-    print_list @ary;
-}
-elsif( $act eq 'clone' || $act eq 'c' ) {
-    my $user;
-    my $repo;
-
-    $user = shift;
-    if( $user =~ /\// ) {
-        ($user,$repo) = split /\//,$user;
-    }
-    else {
-        $repo = shift;
-    }
-
-    my $attr = shift || 'ro';
-    my $uri;
-    if( $attr eq 'ro' ) {
-        $uri = sprintf "git://github.com/%s/%s.git" , $user , $repo;
-    }
-    elsif( $attr eq 'ssh' ) {
-        $uri = sprintf "git\@github.com:%s/%s.git" , $user , $repo;
-    }
-    print $uri . "\n";
-    system( qq{git clone $uri} );
 }
 
-
-
-elsif( $act eq 'pullfork' || $act eq 'pull' || $act eq 'pf' ) 
-{
-    my $acc  = shift;
-    my $branch = shift || 'master';
-
-    die "git config not found." if  ! -e ".git/config" ;
-    my $config = parse_config( ".git/config" );
-
-    # git://github.com/miyagawa/Tatsumaki.git
-    for my $remote ( values %{ $config->{remote} } ) {
-        if ( $remote->{url} =~ m{git://github.com/(.*?)/(.*?).git} 
-            || $remote->{url} =~ m{git\@github.com:(.*?)/(.*?).git} ) 
-        {
-            my ( $my, $repo ) = ( $1, $2 );
-            my $uri = sprintf( qq(git://github.com/%s/%s.git) , $acc , $repo );
-            qx(git pull $uri $branch);
-            last;
-        }
-    }
-
-}
-elsif( $act eq 'list' ) 
-{
-    my $acc = shift;
-    my $json = get 'http://github.com/api/v2/json/repos/show/' . $acc;
-    my $data = decode_json( $json );
-    my @lines = ();
-    for my $repo ( @{ $data->{repositories} } ) {
-        my $repo_name = $repo->{name};
-        push @lines , [  
-            $acc . "/" . $repo->{name} ,
-            ($repo->{description}||"")
-        ];
-    }
-    print_list @lines;
-}
-elsif( $act eq 'cloneall' || $act eq 'ca' ) {
-    my $acc = shift;
-    my $attr = shift || 'ro';
-
-    _info "Getting repository list from github: $acc";
-    my $json = get 'http://github.com/api/v2/json/repos/show/' . $acc;
-    my $data = decode_json( $json );
-
-    _info "Will clone repositories below:";
-    for my $repo ( @{ $data->{repositories} } ) {
-        print "  " . $repo->{name} . "\n";
-    }
-
-
-    for my $repo ( @{ $data->{repositories} } ) {
-        my $repo_name = $repo->{name};
-        my $local_repo_name = $repo_name;
-        $local_repo_name =~ s/\.git$//;
-
-        my $uri;
-        if( $attr eq 'ro' ) {
-            $uri = sprintf "git://github.com/%s/%s.git" , $acc , $repo_name;
-        }
-        elsif( $attr eq 'ssh' ) {
-            $uri = sprintf "git\@github.com:%s/%s.git" , $acc , $repo_name;
-        }
-        print $uri . "\n";
-
-        if( -e $local_repo_name ) {
-            print "Updating " . $local_repo_name . " ...\n";
-            qx{ cd $local_repo_name ; git pull origin master };
-        }
-        else {
-            print "Cloning " . $repo->{name} . " ...\n";
-            qx{ git clone -q $uri };
-        }
-    }
-}
-elsif( $act eq 'network' ) {
-    die "Git config not found." if ( ! -e ".git/config" );
-
-    my $config = parse_config( ".git/config" );
-    for my $remote ( values %{ $config->{remote} } ) {
-        # git://github.com/miyagawa/Tatsumaki.git
-        if ( $remote->{url} =~ m{git://github.com/(.*?)/(.*?).git} 
-            || $remote->{url} =~ m{git\@github.com:(.*?)/(.*?).git} ) 
-        {
-            my ($acc,$repo) = ($1,$2);
-            # curl http://github.com/api/v2/yaml/repos/show/schacon/ruby-git/network
-            my $url = qq(http://github.com/api/v2/json/repos/show/$acc/$repo/network);
-            my $json = get $url;
-            my $objs = decode_json($json);
-            # use Data::Dumper; warn Dumper( $objs );
-            my $networks = $objs->{network};
-
-            for my $net ( @$networks ) {
-                _info sprintf( "% 17s - watchers(%d) forks(%d)"
-                    , $net->{owner} . '/' . $net->{name}
-                    , $net->{watchers}
-                    , $net->{forks}
-                    );
-            }
-            last;
-        }
-    }
-}
-elsif( $act eq 'fork' ) {
-    my $user;
-    my $repo;
-
-    $user = shift;
-    if( $user && $user =~ /\// ) {
-        ($user,$repo) = split /\//,$user;
-    }
-    else {
-        $repo = shift;
-    }
-
-    my $auth = get_github_auth();
-
-    unless( $auth ) {
-        die "Github authtoken not found. Can not fork repository.\n";
-    }
-
-    unless ( $repo ) {
-        # detect .git directory
-        if ( -e ".git/config" ) {
-            my $config = parse_config( ".git/config" );
-            for my $remote ( values %{ $config->{remote} } ) {
-                # git://github.com/miyagawa/Tatsumaki.git
-                if ( $remote->{url} 
-                        =~ m{git://github.com/(.*?)/(.*?).git}  ) {
-                        if( $1 && $2 ) {
-                            ($user,$repo) = ( $1 , $2 );
-
-                            _info "Found GitHub repository of $user/$repo";
-
-                            my $remote_uri = qq( git\@github.com:@{[ $auth->{user} ]}/$repo.git);
-
-                            _info "Adding remote '@{[ $auth->{user} ]}' => $remote_uri";
-
-                            # url = git@github.com:c9s/App-gh.git
-                            my $cmd = qq( git remote add @{[ $auth->{user} ]} $remote_uri);
-                            _debug $cmd;
-                            qx($cmd);
-
-                            _info "Remote added.";
-                        }
-                }
-            }
-        }
-    }
-
-    # curl -F 'login=schacon' -F 'token=XXX' http://github.com/api/v2/yaml/repos/fork/dim/retrospectiva
-=pod
-
-$VAR1 = {
-          'repository' => {
-                            'has_downloads' => bless( do{\(my $o = 1)}, 'JSON::XS::Boolean' ),
-                            'owner' => 'c9s',
-                            'has_issues' => bless( do{\(my $o = 0)}, 'JSON::XS::Boolean' ),
-                            'name' => 'AnyMQ',
-                            'private' => $VAR1->{'repository'}{'has_issues'},
-                            'has_wiki' => $VAR1->{'repository'}{'has_downloads'},
-                            'pushed_at' => '2010/04/06 00:40:45 -0700',
-                            'description' => 'Simple message queue based on AnyEvent',
-                            'watchers' => 1,
-                            'forks' => 0,
-                            'homepage' => '',
-                            'created_at' => '2010/07/21 06:08:11 -0700',
-                            'fork' => $VAR1->{'repository'}{'has_downloads'},
-                            'url' => 'http://github.com/c9s/AnyMQ',
-                            'open_issues' => 0
-                          }
-        };
-=cut
-
-    _info "Forking...";
-
-    my $uri = sprintf("http://github.com/api/v2/json/repos/fork/%s/%s?login=%s&token=%s", $user , $repo , $auth->{user} , $auth->{token} );
-    my $json = get( $uri );
-    my $data = decode_json( $json );
-
-    use Data::Dumper; 
-    warn Dumper( $data ) if debug;
-
-    _info "Repository forked:";
-
-    $data = $data->{repository};
-    print "  Name:          " . $data->{name} . "\n";
-    print "  Description:   " . $data->{description} . "\n";
-    print "  Owner:         " . $data->{owner} . "\n";
-    print "  Watchers:      " . $data->{watchers} . "\n";
-    print "  Created at:    " . $data->{created_at} . "\n";
-    print "  Pushed at:     " . $data->{pushed_at} . "\n";
-    print "  Fork:          " . $data->{'fork'} . "\n";
-    print "  URL:           " . $data->{url} . "\n";
-    print "  Homepage:      " . ($data->{homepage}||'') . "\n";
-}
-
-
-
-
+__END__

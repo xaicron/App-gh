@@ -12,7 +12,7 @@ requires 'JSON';
 requires 'JSON::XS';
 requires 'LWP::Simple';
 requires 'File::Temp';
-requires 'Exporter::Lite';
+requires 'Config::INI::Reader';
 
 install_script 'scripts/gh';
 
