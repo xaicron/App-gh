@@ -16,6 +16,9 @@ requires 'Exporter::Lite';
 
 install_script 'scripts/gh';
 
+tests 't/*.t';
+author_tests 'xt';
+
 auto_install;
 
 WriteAll;
